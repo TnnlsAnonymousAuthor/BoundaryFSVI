@@ -10,22 +10,8 @@ import numpy.random as nr
 import numpy as np
 from torch.utils.data.sampler import SubsetRandomSampler
 
-class AddGaussianNoise(object):
-    def __init__(self, mean=0.0, std=0.1):
-        """
-        :param mean: 高斯噪声的均值
-        :param std: 高斯噪声的标准差
-        """
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, tensor):
-        """
-        :param tensor: 输入图像张量，形状为 (C, H, W)，数值范围为 [0,1]
-        :return: 添加噪声后的图像
-        """
-        noise = torch.randn_like(tensor) * self.std + self.mean
-        return torch.clamp(tensor + noise, 0.0, 1.0)  # 限制范围在[0,1]之间，避免数值溢出
+NUM_WORKERS = 8
+PERSISTENT_WORKERS = True
 
 def getSVHN(batch_size, img_size=32, data_root='/tmp/public_dataset/pytorch', train=True, val=True, custom_tfm=None, **kwargs):
     data_root = os.path.expanduser(os.path.join(data_root, 'svhn-data'))
@@ -49,7 +35,7 @@ def getSVHN(batch_size, img_size=32, data_root='/tmp/public_dataset/pytorch', tr
         train_loader = torch.utils.data.DataLoader(
             datasets.SVHN(
                 root=data_root, split='train', download=True,
-                transform=transforms.Compose([transforms.Scale(img_size), transforms.ToTensor()] + (custom_tfm if custom_tfm else [])),
+                transform=transforms.Compose([transforms.Resize(img_size), transforms.ToTensor()] + (custom_tfm if custom_tfm else [])),
                 target_transform=target_transform,
             ),
             batch_size=batch_size, shuffle=True, **kwargs)
@@ -60,7 +46,7 @@ def getSVHN(batch_size, img_size=32, data_root='/tmp/public_dataset/pytorch', tr
             datasets.SVHN(
                 root=data_root, split='test', download=True,
                 transform=transforms.Compose([
-                    transforms.Scale(img_size),
+                    transforms.Resize(img_size),
                     transforms.ToTensor(),
                 ]),
                 target_transform=target_transform
@@ -80,87 +66,166 @@ def getCIFAR10(batch_size, img_size=32, data_root='/tmp/public_dataset/pytorch',
         train_loader = torch.utils.data.DataLoader(
             datasets.CIFAR10(
                 root=data_root, train=True, download=True,
-                transform=transforms.Compose([transforms.Scale(img_size), transforms.ToTensor()] + (custom_tfm if custom_tfm else []))),
+                transform=transforms.Compose([transforms.Resize(img_size), transforms.ToTensor()] + (custom_tfm if custom_tfm else []))),
             batch_size=batch_size, shuffle=True, **kwargs)
         ds.append(train_loader)
     if val:
         test_loader = torch.utils.data.DataLoader(
             datasets.CIFAR10(
                 root=data_root, train=False, download=True,
-                transform=transforms.Compose([transforms.Scale(img_size), transforms.ToTensor(),] + (custom_tfm_test if custom_tfm_test else []))),
+                transform=transforms.Compose([transforms.Resize(img_size), transforms.ToTensor(),] + (custom_tfm_test if custom_tfm_test else []))),
             batch_size=batch_size, shuffle=False, **kwargs)
         ds.append(test_loader)
     ds = ds[0] if len(ds) == 1 else ds
     return ds
 
-def getTargetDataSet(data_type, batch_size, imageSize, dataroot):
+# Add a small Dataset wrapper that filters CIFAR-10 to only keep specified classes and remap labels
+class _FilteredCIFAR10(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, keep_classes=(3, 5), transform=None):
+        """Wrap a torchvision CIFAR10 dataset and keep only the specified classes.
+        keep_classes: tuple of original labels to keep (e.g. (3,5) for cat,dog).
+        These are remapped to 0..len(keep_classes)-1 in the order given.
+        """
+        self.base = base_dataset
+        # ensure base has targets attribute
+        if not hasattr(self.base, 'targets'):
+            # torchvision older/newer versions might use .targets or .labels
+            self.targets = getattr(self.base, 'labels', None)
+        else:
+            self.targets = self.base.targets
+        self.keep = tuple(keep_classes)
+        # build index map
+        self.indices = [i for i, t in enumerate(self.targets) if t in self.keep]
+        self.class_to_new = {orig: new for new, orig in enumerate(self.keep)}
+        # prefer transform passed to wrapper; if None, use base's transform
+        self.transform = transform if transform is not None else getattr(self.base, 'transform', None)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        orig_idx = self.indices[idx]
+        # get raw image and label from base dataset without applying base.transform
+        # to avoid double-transform, we retrieve raw data from underlying arrays if possible
+        if hasattr(self.base, 'data'):
+            # base.data is numpy array (N,H,W,C)
+            img = self.base.data[orig_idx]
+            # convert to PIL Image for transforms
+            from PIL import Image
+            img = Image.fromarray(img)
+            label = self.base.targets[orig_idx]
+        else:
+            # fallback to base's __getitem__ and then re-apply transform (less ideal)
+            img, label = self.base[orig_idx]
+        new_label = self.class_to_new[label]
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, new_label
+
+def getCIFAR10CatHorse(batch_size, img_size=32, data_root='/tmp/public_dataset/pytorch', train=True, val=True, custom_tfm=None, custom_tfm_test=None, **kwargs):
+    """Return CIFAR-10 dataloaders that contain only the 'cat' and 'dog' classes.
+    The original CIFAR-10 labels for cat and dog are 3 and 5 respectively; they are remapped to 0 (cat) and 1 (dog).
+    Signature mirrors `getCIFAR10`.
+    """
+    data_root = os.path.expanduser(os.path.join(data_root, 'cifar10-data'))
+    num_workers = kwargs.setdefault('num_workers', 1)
+    kwargs.pop('input_size', None)
+    print("Building CIFAR-10 Cat/Dog data loader with {} workers".format(num_workers))
+    ds = []
+
+    # build common transforms
+    train_transform = transforms.Compose([transforms.Resize(img_size), transforms.ToTensor()] + (custom_tfm if custom_tfm else []))
+    test_transform = transforms.Compose([transforms.Resize(img_size), transforms.ToTensor()] + (custom_tfm_test if custom_tfm_test else []))
+
+    if train:
+        base_train = datasets.CIFAR10(root=data_root, train=True, download=True, transform=None)
+        filtered_train = _FilteredCIFAR10(base_train, keep_classes=(3, 7), transform=train_transform)
+        train_loader = torch.utils.data.DataLoader(filtered_train, batch_size=batch_size, shuffle=True, **kwargs)
+        ds.append(train_loader)
+
+    if val:
+        base_test = datasets.CIFAR10(root=data_root, train=False, download=True, transform=None)
+        filtered_test = _FilteredCIFAR10(base_test, keep_classes=(3, 7), transform=test_transform)
+        test_loader = torch.utils.data.DataLoader(filtered_test, batch_size=batch_size, shuffle=False, **kwargs)
+        ds.append(test_loader)
+
+    ds = ds[0] if len(ds) == 1 else ds
+    return ds
+
+def getTargetDataSet(data_type, batch_size, imageSize, dataroot, num_workers=8, persistent_workers=True):
     if data_type == 'cifar10':
-        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'svhn':
-        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == '2d':
         train_loader, test_loader = get_two_gaussian(batch_size=batch_size, context_type="sparse-margin")
+    elif data_type == 'cifar10CatHorse':
+        # convenience alias to load only cat(0) and dog(1) classes from CIFAR-10
+        train_loader, test_loader = getCIFAR10CatHorse(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=0, persistent_workers=False, pin_memory=True)
 
     return train_loader, test_loader
 
-def getNonTargetDataSet(data_type, batch_size, imageSize, dataroot):
+def getNonTargetDataSet(data_type, batch_size, imageSize, dataroot, num_workers=8, persistent_workers=True):
     if data_type == 'cifar10':
-        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'svhn':
-        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'imagenet':
-        testsetout = datasets.ImageFolder(dataroot+"/imagenet-data", transform=transforms.Compose([transforms.Scale(imageSize),transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        testsetout = datasets.ImageFolder(dataroot+"/imagenet-data", transform=transforms.Compose([transforms.Resize(imageSize),transforms.ToTensor()]))
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'lsun':
-        testsetout = datasets.ImageFolder(dataroot+"/lsun-data", transform=transforms.Compose([transforms.Scale(imageSize),transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        testsetout = datasets.ImageFolder(dataroot+"/lsun-data", transform=transforms.Compose([transforms.Resize(imageSize),transforms.ToTensor()]))
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'dtd':
         testsetout = datasets.ImageFolder(dataroot + "/dtd-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'eurosat':
         testsetout = datasets.ImageFolder(dataroot + "/eurosat-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'oxford_flowers':
         testsetout = datasets.ImageFolder(dataroot + "/oxford_flowers-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'iNaturalist':
         testsetout = datasets.ImageFolder(dataroot + "/iNaturalist-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'sun':
         testsetout = datasets.ImageFolder(dataroot + "/SUN-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'places':
         testsetout = datasets.ImageFolder(dataroot + "/Places-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
+    elif data_type == 'imagenet1k-lion':
+        testsetout = datasets.ImageFolder(dataroot + "/imagenet1k-lion-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
+        train_loader, test_loader = None, torch.utils.data.DataLoader(testsetout, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=False, pin_memory=True)
 
     return test_loader
 
-def getContextDataSet(data_type, batch_size, imageSize, dataroot):
+def getContextDataSet(data_type, batch_size, imageSize, dataroot, num_workers=8, persistent_workers=True):
     if data_type == 'svhn_augmentation':
         custom_tfm = [transforms.RandomRotation(60), transforms.RandomHorizontalFlip(), transforms.GaussianBlur(kernel_size=(3, 3), sigma=10), transforms.RandomSolarize(threshold=0.5), transforms.ColorJitter(brightness=0.5, contrast=0.5)]
         # custom_tfm = None
-        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, custom_tfm=custom_tfm, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getSVHN(batch_size=batch_size, img_size=imageSize, data_root=dataroot, custom_tfm=custom_tfm, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'cifar10_augmentation':
         custom_tfm = [transforms.RandomRotation(60), transforms.RandomHorizontalFlip(), transforms.GaussianBlur(kernel_size=(3, 3), sigma=10), transforms.RandomSolarize(threshold=0.5), transforms.ColorJitter(brightness=0.5, contrast=0.5)]
-        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, custom_tfm=custom_tfm, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, custom_tfm=custom_tfm, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'cifar10':
-        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader, test_loader = getCIFAR10(batch_size=batch_size, img_size=imageSize, data_root=dataroot, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'cifar100':
         train_data = datasets.CIFAR100(root=dataroot + "/cifar100-data", train=True, download=True, transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True)
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True)
     elif data_type == 'cifar100_augmentation':
-        custom_tfm = [transforms.Scale(imageSize), transforms.ToTensor(), transforms.RandomRotation(60), transforms.RandomHorizontalFlip(), transforms.GaussianBlur(kernel_size=(3, 3), sigma=10), transforms.RandomSolarize(threshold=0.5), transforms.ColorJitter(brightness=0.5, contrast=0.5)]
+        custom_tfm = [transforms.Resize(imageSize), transforms.ToTensor(), transforms.RandomRotation(60), transforms.RandomHorizontalFlip(), transforms.GaussianBlur(kernel_size=(3, 3), sigma=10), transforms.RandomSolarize(threshold=0.5), transforms.ColorJitter(brightness=0.5, contrast=0.5)]
         train_data = datasets.CIFAR100(root=dataroot + "/cifar100-data", train=True, download=True, transform=transforms.Compose(custom_tfm))
-        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True), None
+        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True), None
     elif data_type == 'caltech10':
         train_data = datasets.ImageFolder(dataroot+"/caltech10-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)),transforms.ToTensor()]))
-        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True), None
+        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True), None
     elif data_type == 'caltech101':
         train_data = datasets.ImageFolder(dataroot + "/caltech101-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=8, persistent_workers=True, pin_memory=True), None
+        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True), None
     elif data_type == 'eurosat':
         train_data = datasets.ImageFolder(dataroot + "/eurosat-data", transform=transforms.Compose([transforms.Resize((imageSize, imageSize)), transforms.ToTensor()]))
-        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=8, persistent_workers=True, pin_memory=True), None
+        train_loader, test_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=num_workers, persistent_workers=persistent_workers, pin_memory=True), None
     return train_loader, test_loader
 
 def get_two_gaussian(batch_size=24, context_type="compact-margin"):

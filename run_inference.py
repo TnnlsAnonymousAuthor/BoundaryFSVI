@@ -63,7 +63,7 @@ if args.ctx_dataset != 'none':
     visualize_dataloader(ctx_train_loader, title=f"Context Data: {args.ctx_dataset}")
 
 print('Load model')
-model = models.vgg13()
+model = models.vgg13(num_classes=args.num_classes)
 bnn.bayesianize_(model, inference='ffg', init_sd=1e-4, prior_weight_sd=1e6, prior_bias_sd=1e6)
 print("Parameter size: %.2fM" % (sum(p.numel() for p in model.parameters()) / 1000000.0))
 
